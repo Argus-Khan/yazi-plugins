@@ -9,13 +9,11 @@ An interactive trash manager for Yazi with filtering, bulk operations, and thumb
 - Multi-select with mark all/none
 - Restore, permanently delete, or empty trash
 - Preview file details and thumbnails (images/videos)
-- Directories shown with trailing `/`
-- Human-readable file sizes
 
 ## Installation
 
 ```sh
-ya pkg add your-username/plugins:trash-manager
+ya pkg add Argus-Khan/yazi-plugins:trash-manager
 ```
 
 ## Usage
@@ -31,20 +29,20 @@ desc = "Trash manager"
 
 ### Keybindings
 
-| Key | Action |
-|-----|--------|
-| `j`/`k` | Move up/down |
-| `g`/`G` | Top/bottom |
-| `<Space>` | Toggle mark |
-| `a` | Mark all (filtered) |
-| `c` | Clear marks |
-| `/` | Filter by path |
-| `\` | Clear filter |
-| `r` | Restore selected |
-| `d` | Delete selected (press twice to confirm) |
-| `e` | Empty entire trash |
-| `v` | Preview details + thumbnail |
-| `q`/`Esc` | Quit |
+| Key       | Action                                   |
+| --------- | ---------------------------------------- |
+| `j`/`k`   | Move up/down                             |
+| `g`/`G`   | Top/bottom                               |
+| `<Space>` | Toggle mark                              |
+| `a`       | Mark all (filtered)                      |
+| `c`       | Clear marks                              |
+| `/`       | Filter by path                           |
+| `\`       | Clear filter                             |
+| `r`       | Restore selected                         |
+| `d`       | Delete selected (press twice to confirm) |
+| `e`       | Empty entire trash                       |
+| `v`       | Preview details + thumbnail              |
+| `q`/`Esc` | Quit                                     |
 
 ## Dependencies
 
@@ -54,4 +52,4 @@ desc = "Trash manager"
 
 ## License
 
-MIT
+UNDERCAT 1.0
