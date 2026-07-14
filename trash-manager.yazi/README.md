@@ -8,6 +8,7 @@ An interactive trash manager for Yazi with filtering, bulk operations, and thumb
 - Filter items by path substring (case-insensitive)
 - Multi-select with mark all/none
 - Restore, permanently delete, or empty trash
+- Undo the last trash operation (single keypress, with confirmation)
 - Preview file details and thumbnails (images/videos)
 
 ## Installation
@@ -25,9 +26,14 @@ Add this to your `~/.config/yazi/keymap.toml`:
 on   = "U"
 run  = "plugin trash-manager"
 desc = "Trash manager"
+
+[[mgr.prepend_keymap]]
+on   = "u"
+run  = "plugin trash-manager -- undo-last"
+desc = "Restore last trashed batch"
 ```
 
-### Keybindings
+### Keybindings (inside the modal)
 
 | Key       | Action                                   |
 | --------- | ---------------------------------------- |
@@ -39,10 +45,24 @@ desc = "Trash manager"
 | `/`       | Filter by path                           |
 | `\`       | Clear filter                             |
 | `r`       | Restore selected                         |
+| `u`       | Undo last trash (restore newest batch)   |
 | `d`       | Delete selected (press twice to confirm) |
 | `e`       | Empty entire trash                       |
 | `v`       | Preview details + thumbnail              |
 | `q`/`Esc` | Quit                                     |
+
+### Headless mode
+
+`plugin trash-manager -- undo-last` skips the modal and prompts to restore
+every item sharing the most recent deletion timestamp. Useful as a
+one-keystroke "undo" binding.
+
+## Credits
+
+The "undo last trash" action is inspired by
+[boydaihungst/restore](https://github.com/boydaihungst/restore) (MIT,
+Copyright (c) 2024 boydaihungst). Reimplemented here on top of `gio trash
+--restore` so it shares the same backend as the rest of the manager.
 
 ## Dependencies
 

@@ -3,6 +3,11 @@
 --- Browse the freedesktop trash across all volumes, multi-select, then
 --- restore / permanently delete / empty. Backed by `gio` (glib), which gives
 --- a unified cross-volume view and stable per-item handles (trash:/// URIs).
+---
+--- The "undo last trash" action is inspired by boydaihungst's `restore` plugin
+--- (MIT, https://github.com/boydaihungst/restore), reimplemented on top of
+--- `gio trash --restore` so it shares the same backend as the rest of the
+--- manager. Original copyright (c) 2024 boydaihungst.
 
 local function notify(level, s, ...)
 	ya.notify({ title = "Trash Manager", content = string.format(s, ...), timeout = 4, level = level })
@@ -242,6 +247,81 @@ local function perform_empty()
 	end
 end
 
+-- Find the most recently trashed batch: all items sharing the latest deletion date.
+---@return table[]|nil batch, string|nil latest_date
+local function latest_batch()
+	local items = load_items()
+	if #items == 0 then
+		return nil, nil
+	end
+	local latest = nil
+	for _, it in ipairs(items) do
+		if not latest or it.date > latest then
+			latest = it.date
+		end
+	end
+	local batch = {}
+	for _, it in ipairs(items) do
+		if it.date == latest then
+			batch[#batch + 1] = it
+		end
+	end
+	return batch, latest
+end
+
+local function perform_undo_last()
+	local batch, latest = latest_batch()
+	if not batch then
+		notify("info", "Trash is empty, nothing to undo")
+		return
+	end
+
+	local preview_max = math.min(8, #batch)
+	local preview = { ui.Line("") }
+	for i = 1, preview_max do
+		preview[#preview + 1] = ui.Line("  " .. batch[i].path)
+	end
+	if #batch > preview_max then
+		preview[#preview + 1] = ui.Line(string.format("  ... and %d more", #batch - preview_max))
+	end
+
+	local ok = ya.confirm({
+		title = ui.Line("Undo last trash"):style(ui.Style():fg("yellow"):bold()),
+		body = ui.Text({
+			ui.Line(""),
+			ui.Line(string.format(
+				"Restore %d item%s from %s?",
+				#batch, #batch == 1 and "" or "s", latest
+			)),
+			table.unpack(preview),
+		}),
+		pos = { "center", w = 70, h = math.min(20, #batch + 5) },
+	})
+	if not ok then
+		return
+	end
+
+	local restored_ok, restored_fail = 0, 0
+	for _, it in ipairs(batch) do
+		local out = Command("gio")
+			:arg({ "trash", "--restore", it.uri })
+			:stdout(Command.PIPED)
+			:stderr(Command.PIPED)
+			:output()
+		if out and out.status and out.status.success then
+			restored_ok = restored_ok + 1
+		else
+			restored_fail = restored_fail + 1
+		end
+	end
+
+	if restored_fail == 0 then
+		notify("info", "Restored %d item%s", restored_ok, restored_ok == 1 and "" or "s")
+	else
+		notify("error", "Restored %d, failed %d", restored_ok, restored_fail)
+	end
+end
+
 local function get_target_path(out)
 	local target = out.stdout:match("standard::target%-uri:%s*file://(.+)")
 	return target and uri_decode(target) or nil
@@ -302,6 +382,7 @@ local M = {
 		{ on = "c", run = "clear" },
 
 		{ on = "r", run = "restore" },
+		{ on = "u", run = "undo_last" },
 		{ on = "d", run = "delete" },
 		{ on = "e", run = "empty" },
 		{ on = "v", run = "view" },
@@ -427,7 +508,7 @@ function M:redraw()
 		local act = ui.Style():fg("yellow")
 		help_text = ui.Text({
 			ui.Line(" j/k move   g/G top/end   <Space> select   a all   c clear   / filter   \\ clear-filter"):style(nav),
-			ui.Line(" r restore   d delete   e empty   v preview   q quit"):style(act),
+			ui.Line(" r restore   u undo-last   d delete   e empty   v preview   q quit"):style(act),
 		})
 	end
 
@@ -443,7 +524,13 @@ function M:redraw()
 	}
 end
 
-function M:entry()
+function M:entry(job)
+	job = job or {}
+	-- Direct, UI-less entry: restore the most recently trashed batch.
+	if job.args and job.args[1] == "undo-last" then
+		perform_undo_last()
+		return
+	end
 	toggle_ui()
 	set_items(load_items())
 
@@ -486,6 +573,9 @@ function M:entry()
 				mark_all(false)
 			elseif run == "restore" then
 				perform_restore()
+			elseif run == "undo_last" then
+				perform_undo_last()
+				set_items(load_items())
 			elseif run == "view" then
 				perform_view()
 			elseif run == "filter" then
