@@ -52,4 +52,4 @@ desc = "Trash manager"
 
 ## License
 
-UNDERCAT LICENSE v1.0
+[UNDERCAT 1.0](../LICENSE)
