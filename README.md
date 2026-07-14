@@ -52,4 +52,4 @@ desc = "Trash manager"
 
 ## License
 
-UNDERCAT 1.0
+UNDERCAT LICENSE v1.0
