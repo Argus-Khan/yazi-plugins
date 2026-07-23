@@ -10,12 +10,7 @@ local TITLE = "Mounter"
 -- ── Capability detection ───────────────────────────────────────────────────
 
 local function has_cmd(name)
-	local out = Command("sh")
-		:arg({ "-c", "command -v " .. name .. " >/dev/null 2>&1" })
-		:stdout(Command.PIPED)
-		:stderr(Command.PIPED)
-		:output()
-	return out and out.status and out.status.success
+	return os.execute("command -v " .. name .. " >/dev/null 2>&1") == true
 end
 
 local HAS_LSBLK = has_cmd("lsblk")
@@ -23,13 +18,27 @@ local HAS_UDISKSCTL = has_cmd("udisksctl")
 local HAS_GIO = has_cmd("gio")
 local HAS_AVAHI = has_cmd("avahi-browse")
 local HAS_TIMEOUT = has_cmd("timeout")
+local HAS_SMBCLIENT = has_cmd("smbclient")
 
 local MTP_ROOT = "/run/user/" .. (os.getenv("UID") or "1000") .. "/gvfs"
 local HOME_DIR = os.getenv("HOME") or "/tmp"
+local MOUNT_DIR = HOME_DIR .. "/ExternalDrives"
+
+function M:setup(args)
+	if args and args.mount_dir then
+		MOUNT_DIR = args.mount_dir:gsub("^~", HOME_DIR)
+	end
+end
 
 local PHONE_URI_REGEX = "(mtp|gphoto2|afc)://[^%s]+"
 local SFTP_URI_REGEX = "sftp://[^%s]+"
 local SMB_URI_REGEX = "smb://[^%s]+"
+
+-- avahi-browse is slow (the plugin blocks on it, leaking focus to the yazi
+-- manager underneath). Cache the discovered hosts for a short TTL so refreshes
+-- don't re-scan the network every time.
+local AVAHI_TTL = 60
+local avahi_cache = { ssh = {}, smb = {}, ts = 0 }
 
 -- ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -40,7 +49,60 @@ end
 local function uri_to_gvfs_entry(uri)
 	local proto, host = uri:match("^([a-z0-9+.-]+)://([^/]+)")
 	if proto and host then
-		return proto .. ":host=" .. host
+		-- Strip userinfo (user:pass@) from the authority; server= must be the bare host.
+		local host_only = host:match("@([^@]*)$") or host
+		if proto == "smb" then
+			local user = uri:match("^smb://([^@:/]+)@")
+			local share = uri:match("^smb://[^/]+/([^/?]+)")
+			-- gvfs canonicalizes smb server and share to lowercase in the gvfs dir name.
+			host_only = host_only:lower()
+			share = share and share:lower()
+			if share then
+				local entry = "smb-share:server=" .. host_only .. ",share=" .. share
+				if user then
+					entry = entry .. ",user=" .. user
+				end
+				return entry
+			end
+			return "smb:host=" .. host_only
+		end
+		return proto .. ":host=" .. host_only
+	end
+	return nil
+end
+
+-- Parse the host and share from an smb:// URI, stripping any userinfo and
+-- lowercasing (gvfs canonical form). Returns host, share (`nil` if no share).
+-- The `[ignore]` arg makes the host/share parsing robust to URIs like
+-- `smb://bridgetech.local/office_share/` (trailing slash) and
+-- `smb://user@host/share` (with userinfo) without the `[^@]*@?` foot-gun.
+local function smb_host_share(uri)
+	local body = uri:match("^smb://(.+)$") or ""
+	-- Drop userinfo (everything up to the first "/") by stripping a leading `user@`.
+	body = body:gsub("^([^/]-)@", "")
+	local host, rest = body:match("^([^/]+)(/.*)$")
+	if not host then
+		host = body
+		rest = ""
+	end
+	local share = rest:match("^/+([^/?#]+)")
+	host = host:lower()
+	share = share and share:lower() or nil
+	return host, share
+end
+
+local function find_gvfs_entry(pattern)
+	local out = Command("ls")
+		:arg({ MTP_ROOT })
+		:stdout(Command.PIPED)
+		:stderr(Command.PIPED)
+		:output()
+	if out and out.stdout then
+		for line in out.stdout:gmatch("[^\r\n]+") do
+			if line:match(pattern) then
+				return line
+			end
+		end
 	end
 	return nil
 end
@@ -49,23 +111,78 @@ local function shell_quote(s)
 	return "'" .. string.gsub(s, "'", "'\\''") .. "'"
 end
 
+local function save_credential(server, share, user, pass)
+	local label = user .. "@" .. server .. "/" .. share
+	os.execute(string.format(
+		"secret-tool store --label %s service samba server %s share %s user %s 2>/dev/null <<< %s",
+		shell_quote(label), shell_quote(server), shell_quote(share), shell_quote(user), shell_quote(pass)
+	))
+end
+
+local function load_credential(server, share)
+	local out = Command("secret-tool")
+		:arg({ "lookup", "service", "samba", "server", server, "share", share })
+		:stdout(Command.PIPED)
+		:stderr(Command.PIPED)
+		:output()
+	if out and out.stdout then
+		local pass = out.stdout:gsub("%s+$", "")
+		if pass ~= "" then
+			local user_out = Command("python3"):arg({ "-c", string.format(
+				"import secretstorage; bus=secretstorage.dbus_init(); c=secretstorage.get_default_collection(bus);\nfor item in c.search_items({'service':'samba','server':%q,'share':%q}):\n    print(item.get_attributes().get('user','')); break",
+				server, share
+			) }):stdout(Command.PIPED):stderr(Command.PIPED):output()
+			local user = ""
+			if user_out and user_out.stdout then
+				user = user_out.stdout:gsub("%s+$", "")
+			end
+			return user, pass
+		end
+	end
+	return nil, nil
+end
+
+local function ensure_mount_dir()
+	os.execute("mkdir -p " .. shell_quote(MOUNT_DIR))
+end
+
+local function link_mount(target, name)
+	ensure_mount_dir()
+	local link = MOUNT_DIR .. "/" .. name
+	os.execute(string.format("ln -sfn %s %s", shell_quote(target), shell_quote(link)))
+end
+
+local function unlink_mount(name)
+	local link = MOUNT_DIR .. "/" .. name
+	os.execute("rm -f " .. shell_quote(link))
+end
+
+local function get_mountpoint(dev)
+	local out = Command("lsblk")
+		:arg({ "-no", "MOUNTPOINTS", dev })
+		:stdout(Command.PIPED)
+		:stderr(Command.PIPED)
+		:output()
+	if out and out.stdout then
+		for line in out.stdout:gmatch("[^\r\n]+") do
+			if line ~= "" and line ~= "[SWAP]" then
+				return line
+			end
+		end
+	end
+	return nil
+end
+
 local function prompt(title, default)
-	local input = ya.input({
+	local value, event = ya.input({
 		title = title,
 		value = default or "",
 		pos = { "center", w = 60 },
 	})
-	if not input then
-		return nil
+	if event == 1 then
+		return value
 	end
-	while true do
-		local value, event = input:recv()
-		if event == 1 then
-			return value
-		elseif event == 2 or event < 0 then
-			return nil
-		end
-	end
+	return nil
 end
 
 -- ── State (ya.sync) ────────────────────────────────────────────────────────
@@ -75,8 +192,6 @@ local toggle_ui = ya.sync(function(self)
 		Modal:children_remove(self.children)
 		self.children = nil
 	else
-		self.cursor = self.cursor or 0
-		self.offset = self.offset or 0
 		self.children = Modal:children_add(self, 10)
 	end
 	ui.render()
@@ -99,6 +214,11 @@ local set_cursor = ya.sync(function(self, idx)
 	local n = #(self.items or {})
 	self.cursor = n == 0 and 0 or ya.clamp(0, idx, n - 1)
 	ui.render()
+end)
+
+local get_active_item = ya.sync(function(self)
+	local items = self.items or {}
+	return items[(self.cursor or 0) + 1]
 end)
 
 -- ── Backend: USB drives ───────────────────────────────────────────────────
@@ -144,6 +264,11 @@ local function mount_drive(dev)
 		:output()
 	if out and out.status and out.status.success then
 		notify("Mounted " .. dev)
+		local mp = get_mountpoint(dev)
+		if mp then
+			local name = dev:match("([^/]+)$") or dev
+			link_mount(mp, name)
+		end
 		return true
 	end
 	local err = out and out.stderr and out.stderr:gsub("%s+", " ") or ""
@@ -163,6 +288,8 @@ local function unmount_drive(dev)
 		:output()
 	if out and out.status and out.status.success then
 		notify("Unmounted " .. dev)
+		local name = dev:match("([^/]+)$") or dev
+		unlink_mount(name)
 		return true
 	end
 	local err = out and out.stderr and out.stderr:gsub("%s+", " ") or ""
@@ -218,9 +345,8 @@ local function mount_phone(uri)
 		local entry = uri_to_gvfs_entry(uri)
 		if entry then
 			local target = MTP_ROOT .. "/" .. entry
-			local link = HOME_DIR .. "/" .. entry
-			os.execute(string.format("ln -sfn %s %s 2>/dev/null", shell_quote(target), shell_quote(link)))
-			notify("Phone mounted: " .. link)
+			link_mount(target, entry)
+			notify("Phone mounted: " .. MOUNT_DIR .. "/" .. entry)
 		else
 			notify("Phone mounted")
 		end
@@ -240,7 +366,7 @@ local function unmount_phone(uri)
 	if out and out.status and out.status.success then
 		local entry = uri_to_gvfs_entry(uri)
 		if entry then
-			os.execute("rm -f " .. shell_quote(HOME_DIR .. "/" .. entry) .. " 2>/dev/null")
+			unlink_mount(entry)
 		end
 		notify("Phone unmounted")
 		return true
@@ -298,6 +424,21 @@ local function scan_avahi(service, timeout_s)
 	return hosts
 end
 
+-- Refresh the avahi cache if stale (or `force` is set). Safe to call on every
+-- refresh; only scans the network when the TTL has expired, so most refreshes
+-- don't block on avahi-browse and leak focus to the yazi manager.
+local function refresh_avahi(force)
+	if not (HAS_AVAHI and HAS_TIMEOUT) then
+		return
+	end
+	if not force and (os.time() - avahi_cache.ts) < AVAHI_TTL then
+		return
+	end
+	avahi_cache.ssh = scan_avahi("_ssh._tcp", 1)
+	avahi_cache.smb = scan_avahi("_smb._tcp", 1)
+	avahi_cache.ts = os.time()
+end
+
 local function normalize_sftp_uri(input)
 	if input:match("^sftp://") then
 		return input
@@ -315,6 +456,37 @@ local function normalize_smb_uri(input)
 	return "smb://" .. input
 end
 
+-- List Disk-type shares on `host` via smbclient (guest unless user/pass given).
+-- Returns an array of share names (lowercased), or {} on failure. We filter IPC$
+-- and printer shares because gio can't mount them.
+local function smb_list_shares(host, user, pass)
+	if not HAS_SMBCLIENT then
+		return {}
+	end
+	local args = { "-L", "//" .. host, "-N" }
+	if user and user ~= "" then
+		args = { "-L", "//" .. host, "-U", user }
+		if pass and pass ~= "" then
+			args[#args + 1] = pass
+		else
+			args[#args + 1] = "-N"
+		end
+	end
+	local out = Command("smbclient"):arg(args):stdout(Command.PIPED):stderr(Command.PIPED):output()
+	if not (out and out.stdout and out.status and out.status.success) then
+		return {}
+	end
+	local shares = {}
+	for line in out.stdout:gmatch("[^\r\n]+") do
+		-- Parse "Sharename       Type      Comment" rows; only take Disk shares.
+		local name, typ = line:match("^%s*(%S+)%s+(Disk)%s")
+		if name and name ~= "IPC$" then
+			shares[#shares + 1] = name:lower()
+		end
+	end
+	return shares
+end
+
 local function mount_sftp(uri)
 	if not HAS_GIO then
 		notify("gio not installed", "error")
@@ -323,6 +495,10 @@ local function mount_sftp(uri)
 	local out = gio_output({ "mount", uri })
 	if out and out.status and out.status.success then
 		local entry = uri_to_gvfs_entry(uri)
+		if entry then
+			local target = MTP_ROOT .. "/" .. entry
+			link_mount(target, entry)
+		end
 		notify("SFTP mounted: " .. (entry and (MTP_ROOT .. "/" .. entry) or uri))
 		return true
 	end
@@ -337,34 +513,166 @@ local function mount_smb_with_auth(uri)
 		return false
 	end
 
-	local host_path = uri:match("^smb://(.+)$") or uri
-	local default_user = os.getenv("USER") or ""
-
-	local user = prompt("SMB — Username (blank = guest):", default_user)
-	if user == nil then
+	-- Split userinfo from authority once: body = [user[:pass]@]host[/share]
+	local body = uri:match("^smb://(.+)$") or uri
+	local userinfo, rest = body:match("^([^/]*@)(.*)$")
+	rest = rest or body -- rest with no userinfo
+	local host = rest:match("^([^/]+)") or rest
+	local share = rest:match("^[^/]+/([^/?]+)") or ""
+	-- gvfs canonicalizes smb server+share to lowercase in both the gvfs dir name and
+	-- `gio mount -l` output, so all gvfs lookups and credential keys must use lowercase.
+	host = host:lower()
+	share = share:lower()
+	-- gio can't mount a host without a share — it just parks the server in the
+	-- browse daemon and reports "already mounted" without ever creating a gvfs dir.
+	if share == "" then
+		notify("SMB share name is required (blank share cannot be mounted): " .. host, "error")
 		return false
 	end
+	-- Always mount the BARE uri (no user:pass@); gio rejects embedded creds with an
+	-- interactive prompt that fails non-interactively. Auth comes from the keyring.
+	local bare_uri = "smb://" .. rest
 
-	local pass = prompt("SMB — Password (blank = none):", "")
-	if pass == nil then
-		return false
+	-- Resolve the gvfs entry name we expect after a successful mount.
+	local function expected_entry()
+		if share ~= "" then
+			return "smb-share:server=" .. host .. ",share=" .. share
+		end
+		return "smb:host=" .. host
 	end
 
-	local final_uri
-	if user ~= "" and pass ~= "" then
-		final_uri = "smb://" .. user .. ":" .. pass .. "@" .. host_path
-	elseif user ~= "" then
-		final_uri = "smb://" .. user .. "@" .. host_path
+	-- Check if already mounted (match any share from this server if none specified)
+	local existing
+	if share ~= "" then
+		existing = find_gvfs_entry("^smb%-share:server=" .. host .. ",share=" .. share .. "$")
 	else
-		final_uri = uri
+		existing = find_gvfs_entry("^smb%-share:server=" .. host)
+	end
+	if existing then
+		local target = MTP_ROOT .. "/" .. existing
+		-- Verify mount is actually accessible
+		local check = Command("ls"):arg({ target }):stdout(Command.NULL):stderr(Command.NULL):output()
+		if check and check.status and check.status.success then
+			link_mount(target, existing)
+			notify("SMB already mounted, linked")
+			return true
+		end
+		-- Stale gvfs dir (not accessible): unmount and clean up before retrying.
+		local s_host = existing:match("server=([^,]+)")
+		local s_share = existing:match("share=([^,]+)")
+		gio_output({ "mount", "-u", "smb://" .. (s_host or host) .. "/" .. (s_share or share) })
+		ya.sleep(1)
+		unlink_mount(existing)
 	end
 
-	local out = gio_output({ "mount", final_uri })
+	-- Credential resolution: prefer saved keyring entry, else prompt and store BEFORE mount.
+	local saved_user, saved_pass = load_credential(host, share)
+	local user, pass
+	if saved_user and saved_pass then
+		user = saved_user
+		pass = saved_pass
+	else
+		user = prompt("SMB — Username (blank = guest):", os.getenv("USER") or "")
+		if user == nil then
+			return false
+		end
+		pass = prompt("SMB — Password (blank = none):", "")
+		if pass == nil then
+			return false
+		end
+		-- Store credentials in the keyring BEFORE mounting so gio's gvfsd-smb can
+		-- resolve them silently. guest (blank user) skips storage.
+		if user ~= "" and pass ~= "" then
+			save_credential(host, share, user, pass)
+		end
+	end
+
+	local out = gio_output({ "mount", bare_uri })
 	if out and out.status and out.status.success then
-		notify("SMB mounted")
+		local entry = expected_entry()
+		local target = MTP_ROOT .. "/" .. entry
+		-- Wait for gvfs to populate the mount dir.
+		for _ = 1, 6 do
+			ya.sleep(0.5)
+			local check = Command("ls"):arg({ target }):stdout(Command.NULL):stderr(Command.NULL):output()
+			if check and check.status and check.status.success then
+				if share ~= "" then
+					link_mount(target, host .. "-" .. share)
+				else
+					link_mount(target, entry)
+				end
+				notify("SMB mounted")
+				return true
+			end
+		end
+		-- Mount reported success but gvfs dir isn't accessible; link anyway and warn.
+		if share ~= "" then
+			link_mount(target, host .. "-" .. share)
+		else
+			link_mount(target, entry)
+		end
+		notify("SMB mounted but share not accessible", "warn")
 		return true
 	end
+
 	local err = out and out.stderr and out.stderr:gsub("%s+", " ") or ""
+
+	-- "Location is already mounted": gvfs thinks it's mounted but the gvfs dir may
+	-- be stale (no entry on disk). Only link if we can verify the target really
+	-- exists; otherwise force-unmount the stale state and retry once.
+	if err:match("already mounted") then
+		-- Try to find and verify a real, accessible gvfs entry for this host/share.
+		local function accessible_entry()
+			local entry = share ~= ""
+				and find_gvfs_entry("^smb%-share:server=" .. host .. ",share=" .. share .. "$")
+				or find_gvfs_entry("^smb%-share:server=" .. host)
+			if not entry then
+				return nil
+			end
+			local t = MTP_ROOT .. "/" .. entry
+			local c = Command("ls"):arg({ t }):stdout(Command.NULL):stderr(Command.NULL):output()
+			if c and c.status and c.status.success then
+				return entry
+			end
+			return nil
+		end
+
+		local entry = accessible_entry()
+		if entry then
+			if share ~= "" then
+				link_mount(MTP_ROOT .. "/" .. entry, host .. "-" .. share)
+			else
+				link_mount(MTP_ROOT .. "/" .. entry, entry)
+			end
+			notify("SMB already mounted, linked")
+			return true
+		end
+
+		-- Stale "already mounted" with no accessible dir: blow away state and retry.
+		gio_output({ "mount", "-u", bare_uri })
+		ya.sleep(1)
+		out = gio_output({ "mount", bare_uri })
+		if out and out.status and out.status.success then
+			local e = expected_entry()
+			local target = MTP_ROOT .. "/" .. e
+			for _ = 1, 6 do
+				ya.sleep(0.5)
+				local c = Command("ls"):arg({ target }):stdout(Command.NULL):stderr(Command.NULL):output()
+				if c and c.status and c.status.success then
+					if share ~= "" then
+						link_mount(target, host .. "-" .. share)
+					else
+						link_mount(target, e)
+					end
+					notify("SMB mounted")
+					return true
+				end
+			end
+		end
+		notify("Failed to mount SMB (already mounted, no accessible share): " .. host .. "/" .. share, "error")
+		return false
+	end
+
 	notify("Failed to mount SMB" .. (err ~= "" and (": " .. err) or ""), "error")
 	return false
 end
@@ -376,6 +684,18 @@ local function unmount_network(uri)
 	end
 	local out = gio_output({ "mount", "-u", uri })
 	if out and out.status and out.status.success then
+		-- Clean up both possible symlinks: friendly name (host-share) and the raw
+		-- gvfs entry name (in case an older plugin version created it).
+		if uri:match("^smb://") then
+			local host, share = smb_host_share(uri)
+			if host and share then
+				unlink_mount(host .. "-" .. share)
+			end
+		end
+		local entry = uri_to_gvfs_entry(uri)
+		if entry then
+			unlink_mount(entry)
+		end
 		notify("Unmounted: " .. uri)
 		return true
 	end
@@ -386,7 +706,23 @@ end
 
 -- ── Build items list ───────────────────────────────────────────────────────
 
+local function cleanup_stale_links()
+	ensure_mount_dir()
+	local out = Command("find")
+		:arg({ MOUNT_DIR, "-maxdepth", "1", "-type", "l", "-xtype", "l" })
+		:stdout(Command.PIPED)
+		:stderr(Command.PIPED)
+		:output()
+	if out and out.stdout then
+		for link in out.stdout:gmatch("[^\r\n]+") do
+			os.execute("rm -f " .. shell_quote(link))
+		end
+	end
+end
+
 local function build_items()
+	cleanup_stale_links()
+	refresh_avahi(false)
 	local items = {}
 
 	-- Unmounted drives
@@ -403,6 +739,8 @@ local function build_items()
 	-- Mounted drives
 	for _, d in ipairs(lsblk_parts()) do
 		if d.mountpoint:match("^/run/media") then
+			local name = d.dev:match("([^/]+)$") or d.dev
+			link_mount(d.mountpoint, name)
 			items[#items + 1] = {
 				type = "unmount_drive",
 				label = "Unmount drive  " .. d.dev .. "  (" .. d.size .. ")",
@@ -414,6 +752,10 @@ local function build_items()
 	-- Phones
 	for _, p in ipairs(list_phones()) do
 		if p.mounted then
+			local entry = uri_to_gvfs_entry(p.uri)
+			if entry then
+				link_mount(MTP_ROOT .. "/" .. entry, entry)
+			end
 			items[#items + 1] = {
 				type = "unmount_phone",
 				label = "Unmount phone: " .. p.name,
@@ -431,6 +773,10 @@ local function build_items()
 	-- Network mounts
 	local sftp_mounted, smb_mounted = list_network_mounts()
 	for _, uri in ipairs(sftp_mounted) do
+		local entry = uri_to_gvfs_entry(uri)
+		if entry then
+			link_mount(MTP_ROOT .. "/" .. entry, entry)
+		end
 		items[#items + 1] = {
 			type = "unmount_sftp",
 			label = "Unmount SFTP: " .. uri:gsub("^sftp://", ""),
@@ -438,6 +784,22 @@ local function build_items()
 		}
 	end
 	for _, uri in ipairs(smb_mounted) do
+		local host, share = smb_host_share(uri)
+		local entry = nil
+		if host and share then
+			entry = find_gvfs_entry("^smb%-share:server=" .. host .. ",share=" .. share)
+		end
+		if not entry then
+			entry = uri_to_gvfs_entry(uri)
+		end
+		if entry then
+			-- Friendly name only; the raw gvfs entry name is too verbose.
+			if share then
+				link_mount(MTP_ROOT .. "/" .. entry, host .. "-" .. share)
+			else
+				link_mount(MTP_ROOT .. "/" .. entry, entry)
+			end
+		end
 		items[#items + 1] = {
 			type = "unmount_smb",
 			label = "Unmount SMB:  " .. uri:gsub("^smb://", ""),
@@ -447,21 +809,37 @@ local function build_items()
 
 	-- Discovered + manual network
 	if HAS_GIO then
-		local ssh_hosts = scan_avahi("_ssh._tcp", 2)
-		local smb_hosts = scan_avahi("_smb._tcp", 2)
-		for _, host in ipairs(ssh_hosts) do
-			items[#items + 1] = {
-				type = "mount_sftp_discovered",
-				label = "Mount SFTP  ›  " .. host,
-				host = host,
-			}
+		local mounted_hosts = {}
+		for _, uri in ipairs(smb_mounted) do
+			local h = smb_host_share(uri)
+			if h then mounted_hosts[h] = true end
 		end
-		for _, host in ipairs(smb_hosts) do
-			items[#items + 1] = {
-				type = "mount_smb_discovered",
-				label = "Mount SMB   ›  " .. host,
-				host = host,
-			}
+		for _, uri in ipairs(sftp_mounted) do
+			local _, h = pcall(function()
+				local body = uri:match("^sftp://(.+)$") or ""
+				body = body:gsub("^([^/]-)@", "")
+				return (body:match("^([^/:]+)") or body):lower()
+			end)
+			if h then mounted_hosts[h] = true end
+		end
+
+		for _, host in ipairs(avahi_cache.ssh) do
+			if not mounted_hosts[host:lower()] then
+				items[#items + 1] = {
+					type = "mount_sftp_discovered",
+					label = "Mount SFTP  ›  " .. host,
+					host = host,
+				}
+			end
+		end
+		for _, host in ipairs(avahi_cache.smb) do
+			if not mounted_hosts[host:lower()] then
+				items[#items + 1] = {
+					type = "mount_smb_discovered",
+					label = "Mount SMB   ›  " .. host,
+					host = host,
+				}
+			end
 		end
 
 		items[#items + 1] = {
@@ -513,8 +891,23 @@ local function activate(item)
 		if share == nil then
 			return
 		end
-		local uri = share == "" and ("smb://" .. item.host) or ("smb://" .. item.host .. "/" .. share)
-		mount_smb_with_auth(uri)
+		if share == "" then
+			-- "browse": list Disk shares via smbclient and auto-mount the only one,
+			-- or re-prompt with the list shown so the user can pick.
+			local shares = smb_list_shares(item.host)
+			if #shares == 0 then
+				notify("No browsable shares found on " .. item.host .. " (need smbclient, or type a share name)", "error")
+				return
+			elseif #shares == 1 then
+				share = shares[1]
+			else
+				share = prompt("Mount SMB — " .. item.host .. " (shares: " .. table.concat(shares, ", ") .. "):", shares[1])
+				if share == nil then
+					return
+				end
+			end
+		end
+		mount_smb_with_auth("smb://" .. item.host .. "/" .. share)
 	elseif item.type == "mount_sftp_manual" then
 		local input = prompt("Mount SFTP (user@host  or  user@host/path):", "")
 		if not input or input == "" then
@@ -544,6 +937,7 @@ M.keys = {
 	{ on = "<Enter>", run = "activate" },
 	{ on = "l", run = "activate" },
 	{ on = "r", run = "refresh" },
+	{ on = "R", run = "rescan" },
 }
 
 function M:new(area)
@@ -619,7 +1013,7 @@ function M:redraw()
 
 	local title = string.format(" Mounter — %d action%s ", #items, #items == 1 and "" or "s")
 	local help_text = ui.Text({
-		ui.Line(" j/k move   g/G top/end   <Enter>/l activate   r refresh   q quit"):style(
+		ui.Line(" j/k move   g/G top/end   <Enter>/l activate   r refresh   R re-scan   q quit"):style(
 			ui.Style():fg("darkgray")
 		),
 	})
@@ -658,9 +1052,14 @@ function M:entry()
 		elseif run == "bottom" then
 			set_cursor(math.huge)
 		elseif run == "refresh" then
+			refresh_avahi(false)
+			set_items(build_items())
+		elseif run == "rescan" then
+			set_items({ { type = "noop", label = "Re-scanning network..." } })
+			refresh_avahi(true)
 			set_items(build_items())
 		elseif run == "activate" then
-			local item = self.items[(self.cursor or 0) + 1]
+			local item = get_active_item()
 			activate(item)
 			set_items(build_items())
 		end

@@ -8,9 +8,18 @@ local TITLE = "Archive"
 -- ── Helpers ────────────────────────────────────────────────────────────────
 
 local archive_exts = {
-	["zip"] = true, ["7z"] = true, ["rar"] = true, ["tar"] = true,
-	["gz"] = true, ["xz"] = true, ["bz2"] = true, ["zst"] = true,
-	["tgz"] = true, ["txz"] = true, ["tbz2"] = true, ["tzst"] = true,
+	["zip"] = true,
+	["7z"] = true,
+	["rar"] = true,
+	["tar"] = true,
+	["gz"] = true,
+	["xz"] = true,
+	["bz2"] = true,
+	["zst"] = true,
+	["tgz"] = true,
+	["txz"] = true,
+	["tbz2"] = true,
+	["tzst"] = true,
 	["xapk"] = true,
 }
 
@@ -40,24 +49,25 @@ end
 
 local function has_cmd(name)
 	local out = Command("sh")
-		:arg({ "-c", "command -v " .. shell_quote(name) .. " >/dev/null 2>&1" })
-		:stdout(Command.PIPED)
-		:stderr(Command.PIPED)
-		:output()
+			:arg({ "-c", "command -v " .. shell_quote(name) .. " >/dev/null 2>&1" })
+			:stdout(Command.PIPED)
+			:stderr(Command.PIPED)
+			:output()
 	return out and out.status and out.status.success
 end
 
 -- ── Compress formats ───────────────────────────────────────────────────────
 
 local COMPRESS_FORMATS = {
-	["7z"]      = { ext = "7z",      tool = "7z",  build = function(out, files) return "7z a "            .. out .. " " .. files end },
-	["zip"]     = { ext = "zip",     tool = "7z",  build = function(out, files) return "7z a -tzip "      .. out .. " " .. files end },
-	["rar"]     = { ext = "rar",     tool = "rar", build = function(out, files) return "rar a "           .. out .. " " .. files end },
-	["tar"]     = { ext = "tar",     tool = "tar", build = function(out, files) return "tar -cf "         .. out .. " " .. files end },
-	["tar.gz"]  = { ext = "tar.gz",  tool = "tar", build = function(out, files) return "tar -czf "        .. out .. " " .. files end },
-	["tar.bz2"] = { ext = "tar.bz2", tool = "tar", build = function(out, files) return "tar -cjf "        .. out .. " " .. files end },
-	["tar.xz"]  = { ext = "tar.xz",  tool = "tar", build = function(out, files) return "tar -cJf "        .. out .. " " .. files end },
-	["tar.zst"] = { ext = "tar.zst", tool = "tar", build = function(out, files) return "tar --zstd -cf "  .. out .. " " .. files end },
+	["7z"]      = { ext = "7z", tool = "7z", build = function(out, files) return "7z a " .. out .. " " .. files end },
+	["zip"]     = { ext = "zip", tool = "7z", build = function(out, files) return "7z a -tzip " .. out .. " " .. files end },
+	["rar"]     = { ext = "rar", tool = "rar", build = function(out, files) return "rar a " .. out .. " " .. files end },
+	["tar"]     = { ext = "tar", tool = "tar", build = function(out, files) return "tar -cf " .. out .. " " .. files end },
+	["tar.gz"]  = { ext = "tar.gz", tool = "tar", build = function(out, files) return "tar -czf " .. out .. " " .. files end },
+	["tar.bz2"] = { ext = "tar.bz2", tool = "tar", build = function(out, files) return "tar -cjf " .. out .. " " .. files end },
+	["tar.xz"]  = { ext = "tar.xz", tool = "tar", build = function(out, files) return "tar -cJf " .. out .. " " .. files end },
+	["tar.zst"] = { ext = "tar.zst", tool = "tar", build = function(out, files) return "tar --zstd -cf " ..
+		out .. " " .. files end },
 }
 
 local DEFAULT_FORMAT = "7z"
@@ -67,14 +77,14 @@ local DEFAULT_FORMAT = "7z"
 -- Component methods installed on M are called with self = state at render time.
 
 local DD_KEYS = {
-	{ on = "k", run = "up" },
-	{ on = "<Up>", run = "up" },
-	{ on = "j", run = "down" },
-	{ on = "<Down>", run = "down" },
-	{ on = "l", run = "select" },
+	{ on = "k",       run = "up" },
+	{ on = "<Up>",    run = "up" },
+	{ on = "j",       run = "down" },
+	{ on = "<Down>",  run = "down" },
+	{ on = "l",       run = "select" },
 	{ on = "<Enter>", run = "select" },
-	{ on = "<Esc>", run = "cancel" },
-	{ on = "q", run = "cancel" },
+	{ on = "<Esc>",   run = "cancel" },
+	{ on = "q",       run = "cancel" },
 }
 
 local dropdown_init = ya.sync(function(state, title, options)
@@ -116,21 +126,21 @@ function M:layout(area)
 	local h = math.min(#(self.dd_options or {}) + 4, area.h - 4)
 	local w = math.min(40, area.w - 4)
 	local v = ui.Layout()
-		:direction(ui.Layout.VERTICAL)
-		:constraints({
-			ui.Constraint.Min(0),
-			ui.Constraint.Length(h),
-			ui.Constraint.Min(0),
-		})
-		:split(area)
+			:direction(ui.Layout.VERTICAL)
+			:constraints({
+				ui.Constraint.Min(0),
+				ui.Constraint.Length(h),
+				ui.Constraint.Min(0),
+			})
+			:split(area)
 	local hz = ui.Layout()
-		:direction(ui.Layout.HORIZONTAL)
-		:constraints({
-			ui.Constraint.Min(0),
-			ui.Constraint.Length(w),
-			ui.Constraint.Min(0),
-		})
-		:split(v[2])
+			:direction(ui.Layout.HORIZONTAL)
+			:constraints({
+				ui.Constraint.Min(0),
+				ui.Constraint.Length(w),
+				ui.Constraint.Min(0),
+			})
+			:split(v[2])
 	self.dd_area = hz[2]
 end
 
@@ -166,16 +176,18 @@ function M:redraw()
 	return {
 		ui.Clear(area),
 		ui.Border(ui.Edge.ALL)
-			:area(area)
-			:type(ui.Border.ROUNDED)
-			:style(ui.Style():fg("yellow"))
-			:title(ui.Line(" " .. (self.dd_title or "") .. " "):align(ui.Align.CENTER)),
+				:area(area)
+				:type(ui.Border.ROUNDED)
+				:style(ui.Style():fg("yellow"))
+				:title(ui.Line(" " .. (self.dd_title or "") .. " "):align(ui.Align.CENTER)),
 		ui.Text(lines):area(inner),
 	}
 end
 
 function M:click() end
+
 function M:scroll() end
+
 function M:touch() end
 
 -- Show dropdown, block until user selects, return option.value or nil.
@@ -319,10 +331,10 @@ function M:peek(job)
 	end
 
 	local child = Command("7z")
-		:arg({ "l", "-ba", path })
-		:stdout(Command.PIPED)
-		:stderr(Command.PIPED)
-		:spawn()
+			:arg({ "l", "-ba", path })
+			:stdout(Command.PIPED)
+			:stderr(Command.PIPED)
+			:spawn()
 	if not child then
 		return require("code"):peek(job)
 	end
