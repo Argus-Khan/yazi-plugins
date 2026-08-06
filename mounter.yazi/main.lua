@@ -1038,37 +1038,23 @@ function M:entry()
 	toggle_ui()
 	set_items({ { type = "noop", label = "Scanning for devices..." } })
 
-	-- Show local items immediately (fast)
+	-- Fast path: show local items + cached avahi instantly
+	local items = {}
 	local local_items, sftp_mounted, smb_mounted = build_local_items()
-	set_items(local_items)
-
-	-- Populate discovered hosts via timer (avahi scan is slow)
-	local discovered_ready = false
-	local discovered_items = nil
-	ya.timer(0.1, 1, function()
-		discovered_items = {}
-		append_discovered_items(discovered_items, sftp_mounted, smb_mounted)
-		discovered_ready = true
-	end)
+	for _, item in ipairs(local_items) do
+		items[#items + 1] = item
+	end
+	-- Avahi cache is warm from previous scan; append discovered hosts (no blocking)
+	append_discovered_items(items, sftp_mounted, smb_mounted)
+	if #items == 0 then
+		items[#items + 1] = { type = "noop", label = "(no devices or actions available)" }
+	end
+	set_items(items)
 
 	while true do
 		local idx = ya.which({ cands = self.keys, silent = true })
 		local cand = idx and self.keys[idx]
 		local run = cand and cand.run
-
-		-- If avahi scan finished, merge discovered items into the list
-		if discovered_ready and discovered_items then
-			local cur = self.items or {}
-			-- Only append if not already present (avoid duplicates on refresh)
-			if #cur > 0 and cur[#cur].type ~= "mount_smb_manual" then
-				for _, item in ipairs(discovered_items) do
-					cur[#cur + 1] = item
-				end
-				set_items(cur)
-			end
-			discovered_ready = false
-			discovered_items = nil
-		end
 
 		if run == "quit" then
 			toggle_ui()
@@ -1082,33 +1068,45 @@ function M:entry()
 		elseif run == "bottom" then
 			set_cursor(math.huge)
 		elseif run == "refresh" then
+			-- Cache is warm: re-scan is fast
+			refresh_avahi(false)
 			local_items, sftp_mounted, smb_mounted = build_local_items()
-			set_items(local_items)
-			discovered_ready = false
-			discovered_items = nil
-			ya.timer(0.1, 1, function()
-				discovered_items = {}
-				append_discovered_items(discovered_items, sftp_mounted, smb_mounted)
-				discovered_ready = true
-			end)
+			items = {}
+			for _, item in ipairs(local_items) do
+				items[#items + 1] = item
+			end
+			append_discovered_items(items, sftp_mounted, smb_mounted)
+			if #items == 0 then
+				items[#items + 1] = { type = "noop", label = "(no devices or actions available)" }
+			end
+			set_items(items)
 		elseif run == "rescan" then
 			set_items({ { type = "noop", label = "Re-scanning network..." } })
 			refresh_avahi(true)
-			discovered_items = {}
-			append_discovered_items(discovered_items, sftp_mounted, smb_mounted)
-			discovered_ready = true
+			local_items, sftp_mounted, smb_mounted = build_local_items()
+			items = {}
+			for _, item in ipairs(local_items) do
+				items[#items + 1] = item
+			end
+			append_discovered_items(items, sftp_mounted, smb_mounted)
+			if #items == 0 then
+				items[#items + 1] = { type = "noop", label = "(no devices or actions available)" }
+			end
+			set_items(items)
 		elseif run == "activate" then
 			local item = get_active_item()
 			activate(item)
+			refresh_avahi(false)
 			local_items, sftp_mounted, smb_mounted = build_local_items()
-			set_items(local_items)
-			discovered_ready = false
-			discovered_items = nil
-			ya.timer(0.1, 1, function()
-				discovered_items = {}
-				append_discovered_items(discovered_items, sftp_mounted, smb_mounted)
-				discovered_ready = true
-			end)
+			items = {}
+			for _, item in ipairs(local_items) do
+				items[#items + 1] = item
+			end
+			append_discovered_items(items, sftp_mounted, smb_mounted)
+			if #items == 0 then
+				items[#items + 1] = { type = "noop", label = "(no devices or actions available)" }
+			end
+			set_items(items)
 		end
 	end
 end
