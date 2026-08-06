@@ -722,7 +722,6 @@ end
 
 local function build_items()
 	cleanup_stale_links()
-	refresh_avahi(false)
 	local items = {}
 
 	-- Unmounted drives
@@ -770,7 +769,7 @@ local function build_items()
 		end
 	end
 
-	-- Network mounts
+	-- Network mounts (gio query is fast, no network scan)
 	local sftp_mounted, smb_mounted = list_network_mounts()
 	for _, uri in ipairs(sftp_mounted) do
 		local entry = uri_to_gvfs_entry(uri)
@@ -807,7 +806,8 @@ local function build_items()
 		}
 	end
 
-	-- Discovered + manual network
+	-- Discovered + manual network (avahi scan can be slow, so it goes last)
+	refresh_avahi(false)
 	if HAS_GIO then
 		local mounted_hosts = {}
 		for _, uri in ipairs(smb_mounted) do
