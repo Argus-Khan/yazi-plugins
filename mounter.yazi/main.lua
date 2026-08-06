@@ -306,35 +306,6 @@ local function gio_output(args)
 	return Command("gio"):arg(args):stdout(Command.PIPED):stderr(Command.PIPED):output()
 end
 
-local function list_phones()
-	if not HAS_GIO then
-		return {}
-	end
-	local mounted = gio_output({ "mount", "-l" })
-	local available = gio_output({ "mount", "-li" })
-
-	local function first_uri(out, pat)
-		if not (out and out.stdout) then
-			return nil
-		end
-		return out.stdout:match(pat)
-	end
-
-	local mounted_uri = first_uri(mounted, PHONE_URI_REGEX)
-	if mounted_uri then
-		local name = (mounted_uri:match("^[^:/]+://([^/]+)") or "phone"):gsub("_", " ")
-		return { { name = name, uri = mounted_uri, mounted = true } }
-	end
-
-	local avail_uri = first_uri(available, PHONE_URI_REGEX)
-	if avail_uri then
-		local name = (avail_uri:match("^[^:/]+://([^/]+)") or "phone"):gsub("_", " ")
-		return { { name = name, uri = avail_uri, mounted = false } }
-	end
-
-	return {}
-end
-
 local function mount_phone(uri)
 	if not HAS_GIO then
 		notify("gio not installed", "error")
@@ -378,22 +349,39 @@ end
 
 -- ── Backend: network ───────────────────────────────────────────────────────
 
-local function list_network_mounts()
+-- Single gio query: returns phones, sftp_mounted, smb_mounted.
+-- Uses one `gio mount -li` call (~0.5s) for all data.
+local function query_gio()
+	local phones, sftp, smb = {}, {}, {}
 	if not HAS_GIO then
-		return {}, {}
+		return phones, sftp, smb
 	end
-	local out = gio_output({ "mount", "-l" })
+	local out = gio_output({ "mount", "-li" })
 	if not (out and out.stdout) then
-		return {}, {}
+		return phones, sftp, smb
 	end
-	local sftp, smb = {}, {}
-	for uri in out.stdout:gmatch(SFTP_URI_REGEX) do
+	local std = out.stdout
+	-- Phones:gio mount -li shows both mounted and available volumes.
+	-- We detect mounted by checking if the MTP directory exists.
+	local phone_uri = std:match(PHONE_URI_REGEX)
+	if phone_uri then
+		local name = (phone_uri:match("^[^:/]+://([^/]+)") or "phone"):gsub("_", " ")
+		local entry = uri_to_gvfs_entry(phone_uri)
+		local mounted = false
+		if entry then
+			local check = Command("ls"):arg({ MTP_ROOT .. "/" .. entry }):stdout(Command.NULL):stderr(Command.NULL):output()
+			mounted = check and check.status and check.status.success
+		end
+		phones[#phones + 1] = { name = name, uri = phone_uri, mounted = mounted }
+	end
+	-- Network mounts
+	for uri in std:gmatch(SFTP_URI_REGEX) do
 		sftp[#sftp + 1] = uri
 	end
-	for uri in out.stdout:gmatch(SMB_URI_REGEX) do
+	for uri in std:gmatch(SMB_URI_REGEX) do
 		smb[#smb + 1] = uri
 	end
-	return sftp, smb
+	return phones, sftp, smb
 end
 
 local function scan_avahi(service, timeout_s)
@@ -749,8 +737,9 @@ local function build_local_items()
 		end
 	end
 
-	-- Phones
-	for _, p in ipairs(list_phones()) do
+	-- Phones + network mounts (single gio call)
+	local phones, sftp_mounted, smb_mounted = query_gio()
+	for _, p in ipairs(phones) do
 		if p.mounted then
 			local entry = uri_to_gvfs_entry(p.uri)
 			if entry then
@@ -770,8 +759,6 @@ local function build_local_items()
 		end
 	end
 
-	-- Network mounts (gio query is fast, no network scan)
-	local sftp_mounted, smb_mounted = list_network_mounts()
 	for _, uri in ipairs(sftp_mounted) do
 		local entry = uri_to_gvfs_entry(uri)
 		if entry then
