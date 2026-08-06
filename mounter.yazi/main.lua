@@ -720,7 +720,8 @@ local function cleanup_stale_links()
 	end
 end
 
-local function build_items()
+-- Build local items only (fast: drives, phones, existing network mounts).
+local function build_local_items()
 	cleanup_stale_links()
 	local items = {}
 
@@ -792,7 +793,6 @@ local function build_items()
 			entry = uri_to_gvfs_entry(uri)
 		end
 		if entry then
-			-- Friendly name only; the raw gvfs entry name is too verbose.
 			if share then
 				link_mount(MTP_ROOT .. "/" .. entry, host .. "-" .. share)
 			else
@@ -806,59 +806,63 @@ local function build_items()
 		}
 	end
 
-	-- Discovered + manual network (avahi scan can be slow, so it goes last)
-	refresh_avahi(false)
-	if HAS_GIO then
-		local mounted_hosts = {}
-		for _, uri in ipairs(smb_mounted) do
-			local h = smb_host_share(uri)
-			if h then mounted_hosts[h] = true end
-		end
-		for _, uri in ipairs(sftp_mounted) do
-			local _, h = pcall(function()
-				local body = uri:match("^sftp://(.+)$") or ""
-				body = body:gsub("^([^/]-)@", "")
-				return (body:match("^([^/:]+)") or body):lower()
-			end)
-			if h then mounted_hosts[h] = true end
-		end
-
-		for _, host in ipairs(avahi_cache.ssh) do
-			if not mounted_hosts[host:lower()] then
-				items[#items + 1] = {
-					type = "mount_sftp_discovered",
-					label = "Mount SFTP  ›  " .. host,
-					host = host,
-				}
-			end
-		end
-		for _, host in ipairs(avahi_cache.smb) do
-			if not mounted_hosts[host:lower()] then
-				items[#items + 1] = {
-					type = "mount_smb_discovered",
-					label = "Mount SMB   ›  " .. host,
-					host = host,
-				}
-			end
-		end
-
-		items[#items + 1] = {
-			type = "mount_sftp_manual",
-			label = "Mount SFTP  ›  manual address…",
-		}
-		items[#items + 1] = {
-			type = "mount_smb_manual",
-			label = "Mount SMB   ›  manual address…",
-		}
-	end
-
 	if #items == 0 then
 		items[#items + 1] = {
 			type = "noop",
-			label = "(no devices or actions available)",
+			label = "(no devices found — scanning network...)",
 		}
 	end
 
+	return items, sftp_mounted, smb_mounted
+end
+
+-- Append avahi-discovered hosts to an existing items list (slow: network scan).
+local function append_discovered_items(items, sftp_mounted, smb_mounted)
+	refresh_avahi(false)
+	if not HAS_GIO then
+		return items
+	end
+	local mounted_hosts = {}
+	for _, uri in ipairs(smb_mounted) do
+		local h = smb_host_share(uri)
+		if h then mounted_hosts[h] = true end
+	end
+	for _, uri in ipairs(sftp_mounted) do
+		local _, h = pcall(function()
+			local body = uri:match("^sftp://(.+)$") or ""
+			body = body:gsub("^([^/]-)@", "")
+			return (body:match("^([^/:]+)") or body):lower()
+		end)
+		if h then mounted_hosts[h] = true end
+	end
+
+	for _, host in ipairs(avahi_cache.ssh) do
+		if not mounted_hosts[host:lower()] then
+			items[#items + 1] = {
+				type = "mount_sftp_discovered",
+				label = "Mount SFTP  ›  " .. host,
+				host = host,
+			}
+		end
+	end
+	for _, host in ipairs(avahi_cache.smb) do
+		if not mounted_hosts[host:lower()] then
+			items[#items + 1] = {
+				type = "mount_smb_discovered",
+				label = "Mount SMB   ›  " .. host,
+				host = host,
+			}
+		end
+	end
+
+	items[#items + 1] = {
+		type = "mount_sftp_manual",
+		label = "Mount SFTP  ›  manual address…",
+	}
+	items[#items + 1] = {
+		type = "mount_smb_manual",
+		label = "Mount SMB   ›  manual address…",
+	}
 	return items
 end
 
@@ -1033,12 +1037,38 @@ end
 function M:entry()
 	toggle_ui()
 	set_items({ { type = "noop", label = "Scanning for devices..." } })
-	set_items(build_items())
+
+	-- Show local items immediately (fast)
+	local local_items, sftp_mounted, smb_mounted = build_local_items()
+	set_items(local_items)
+
+	-- Populate discovered hosts via timer (avahi scan is slow)
+	local discovered_ready = false
+	local discovered_items = nil
+	ya.timer(0.1, 1, function()
+		discovered_items = {}
+		append_discovered_items(discovered_items, sftp_mounted, smb_mounted)
+		discovered_ready = true
+	end)
 
 	while true do
 		local idx = ya.which({ cands = self.keys, silent = true })
 		local cand = idx and self.keys[idx]
 		local run = cand and cand.run
+
+		-- If avahi scan finished, merge discovered items into the list
+		if discovered_ready and discovered_items then
+			local cur = self.items or {}
+			-- Only append if not already present (avoid duplicates on refresh)
+			if #cur > 0 and cur[#cur].type ~= "mount_smb_manual" then
+				for _, item in ipairs(discovered_items) do
+					cur[#cur + 1] = item
+				end
+				set_items(cur)
+			end
+			discovered_ready = false
+			discovered_items = nil
+		end
 
 		if run == "quit" then
 			toggle_ui()
@@ -1052,16 +1082,33 @@ function M:entry()
 		elseif run == "bottom" then
 			set_cursor(math.huge)
 		elseif run == "refresh" then
-			refresh_avahi(false)
-			set_items(build_items())
+			local_items, sftp_mounted, smb_mounted = build_local_items()
+			set_items(local_items)
+			discovered_ready = false
+			discovered_items = nil
+			ya.timer(0.1, 1, function()
+				discovered_items = {}
+				append_discovered_items(discovered_items, sftp_mounted, smb_mounted)
+				discovered_ready = true
+			end)
 		elseif run == "rescan" then
 			set_items({ { type = "noop", label = "Re-scanning network..." } })
 			refresh_avahi(true)
-			set_items(build_items())
+			discovered_items = {}
+			append_discovered_items(discovered_items, sftp_mounted, smb_mounted)
+			discovered_ready = true
 		elseif run == "activate" then
 			local item = get_active_item()
 			activate(item)
-			set_items(build_items())
+			local_items, sftp_mounted, smb_mounted = build_local_items()
+			set_items(local_items)
+			discovered_ready = false
+			discovered_items = nil
+			ya.timer(0.1, 1, function()
+				discovered_items = {}
+				append_discovered_items(discovered_items, sftp_mounted, smb_mounted)
+				discovered_ready = true
+			end)
 		end
 	end
 end
