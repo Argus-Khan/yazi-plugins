@@ -1,15 +1,22 @@
 --- @since 26.5.6
 --- Wrapper around yazi's `remove` that handles MTP mounts gracefully.
 --- MTP doesn't support .Trash, so `gio trash` fails. This plugin detects
---- MTP paths and uses `gio remove` (permanent delete) for those, while
---- using `gio trash` for everything else (same as yazi's built-in).
+--- MTP paths (including through symlinks) and uses `gio remove` for those.
 
 local M = {}
 
-local MTP_GVFS = "/run/user/" .. (os.getenv("UID") or "1000") .. "/gvfs/mtp:host="
+local MTP_PATTERNS = {
+	"/run/user/%d+/gvfs/mtp:host=",
+	"ExternalDrives/mtp:host=",
+}
 
 local function is_mtp(path)
-	return path:sub(1, #MTP_GVFS) == MTP_GVFS
+	for _, pat in ipairs(MTP_PATTERNS) do
+		if path:match(pat) then
+			return true
+		end
+	end
+	return false
 end
 
 local function url_to_path(url)
@@ -77,7 +84,6 @@ function M:entry(job)
 			notify("error", "Failed to %s %s%s", verb, f.name, err ~= "" and (": " .. err) or "")
 		end
 	end
-	ya.mgr_refresh()
 	if fail == 0 then
 		notify("info", "Removed %d file%s", ok, ok == 1 and "" or "s")
 	elseif ok > 0 then
