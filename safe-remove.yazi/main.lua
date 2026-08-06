@@ -12,17 +12,33 @@ local function is_mtp(path)
 	return path:sub(1, #MTP_GVFS) == MTP_GVFS
 end
 
-local function file_path(f)
-	local url = tostring(f.url)
-	if url:sub(1, 7) == "file://" then
-		return url:sub(8)
+local function url_to_path(url)
+	local s = tostring(url)
+	if s:sub(1, 7) == "file://" then
+		return s:sub(8)
 	end
-	return url
+	return s
 end
 
 local function notify(level, s, ...)
 	ya.notify({ title = "Safe Remove", content = string.format(s, ...), timeout = 3, level = level })
 end
+
+local get_targets = ya.sync(function()
+	local tab = cx.active
+	local files = {}
+	if tab.selected then
+		for k, v in pairs(tab.selected) do
+			local url = type(v) == "boolean" and k or v
+			files[#files + 1] = { path = url_to_path(url), name = tostring(url):match("([^/]+)$") or "?" }
+		end
+	end
+	if #files == 0 and tab.current.hovered then
+		local url = tab.current.hovered.url
+		files[1] = { path = url_to_path(url), name = tostring(url):match("([^/]+)$") or "?" }
+	end
+	return files
+end)
 
 function M:entry(job)
 	local args = job.args or {}
@@ -33,20 +49,19 @@ function M:entry(job)
 		end
 	end
 
-	local files = ya.selected({ confirm = true })
+	local files = get_targets()
 	if #files == 0 then
 		return
 	end
 
 	local ok, fail = 0, 0
 	for _, f in ipairs(files) do
-		local path = file_path(f)
 		local cmd, verb
-		if permanent or is_mtp(path) then
-			cmd = { "remove", path }
+		if permanent or is_mtp(f.path) then
+			cmd = { "remove", f.path }
 			verb = "delete"
 		else
-			cmd = { "trash", path }
+			cmd = { "trash", f.path }
 			verb = "trash"
 		end
 		local out = Command("gio")
