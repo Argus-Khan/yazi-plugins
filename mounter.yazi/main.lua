@@ -30,7 +30,7 @@ function M:setup(args)
 	end
 end
 
-local PHONE_URI_REGEX = "mtp://[^%s]+|gphoto2://[^%s]+|afc://[^%s]+"
+local PHONE_URI_REGEX = "mtp://[^%s]+"
 local SFTP_URI_REGEX = "sftp://[^%s]+"
 local SMB_URI_REGEX = "smb://[^%s]+"
 
