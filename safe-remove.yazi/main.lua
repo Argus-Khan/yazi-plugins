@@ -4,6 +4,8 @@
 --- MTP paths and uses `gio remove` (permanent delete) for those, while
 --- using `gio trash` for everything else (same as yazi's built-in).
 
+local M = {}
+
 local MTP_GVFS = "/run/user/" .. (os.getenv("UID") or "1000") .. "/gvfs/mtp:host="
 
 local function is_mtp(path)
