@@ -228,25 +228,44 @@ local function lsblk_parts()
 		return {}
 	end
 	local out = Command("lsblk")
-		:arg({ "-lpno", "NAME,SIZE,TYPE,MOUNTPOINTS" })
+		:arg({ "-lpno", "NAME,SIZE,TYPE,RM,MOUNTPOINTS" })
 		:stdout(Command.PIPED)
 		:stderr(Command.PIPED)
 		:output()
 	if not (out and out.status and out.status.success) then
 		return {}
 	end
-	local items = {}
+	-- Collect all rows first so we can skip removable disks that already have
+	-- partitions (udisksctl can't mount a disk with a partition table).
+	local rows, disks = {}, {}
 	for line in out.stdout:gmatch("[^\r\n]+") do
 		local fields = {}
 		for f in line:gmatch("%S+") do
 			fields[#fields + 1] = f
 		end
-		if #fields >= 3 and fields[3] == "part" then
-			items[#items + 1] = {
-				dev = fields[1],
-				size = fields[2],
-				mountpoint = fields[4] or "",
-			}
+		if #fields >= 4 then
+			local row = { dev = fields[1], size = fields[2], typ = fields[3], rm = fields[4], mp = fields[5] or "" }
+			rows[#rows + 1] = row
+			if row.typ == "disk" then
+				disks[#disks + 1] = row
+			end
+		end
+	end
+	local has_part = {}
+	for _, r in ipairs(rows) do
+		if r.typ == "part" then
+			for _, d in ipairs(disks) do
+				if r.dev:sub(1, #d.dev) == d.dev then
+					has_part[d.dev] = true
+					break
+				end
+			end
+		end
+	end
+	local items = {}
+	for _, r in ipairs(rows) do
+		if r.typ == "part" or (r.typ == "disk" and r.rm == "1" and not has_part[r.dev]) then
+			items[#items + 1] = { dev = r.dev, size = r.size, mountpoint = r.mp }
 		end
 	end
 	return items
@@ -793,19 +812,12 @@ local function build_local_items()
 		}
 	end
 
-	if #items == 0 then
-		items[#items + 1] = {
-			type = "noop",
-			label = "(no devices found — scanning network...)",
-		}
-	end
-
 	return items, sftp_mounted, smb_mounted
 end
 
 -- Append avahi-discovered hosts to an existing items list (slow: network scan).
-local function append_discovered_items(items, sftp_mounted, smb_mounted)
-	refresh_avahi(false)
+local function append_discovered_items(items, sftp_mounted, smb_mounted, force)
+	refresh_avahi(force or false)
 	if not HAS_GIO then
 		return items
 	end
@@ -1026,126 +1038,15 @@ function M:entry()
 	set_items({ { type = "noop", label = "Scanning for devices..." } })
 
 	-- Phase 1: drives (instant — lsblk is 0.004s)
-	local items = {}
-	for _, d in ipairs(lsblk_parts()) do
-		if d.mountpoint == "" then
-			items[#items + 1] = {
-				type = "mount_drive",
-				label = "Mount drive  " .. d.dev .. "  (" .. d.size .. ")",
-				dev = d.dev,
-			}
-		end
-	end
-	for _, d in ipairs(lsblk_parts()) do
-		if d.mountpoint:match("^/run/media") then
-			local name = d.dev:match("([^/]+)$") or d.dev
-			link_mount(d.mountpoint, name)
-			items[#items + 1] = {
-				type = "unmount_drive",
-				label = "Unmount drive  " .. d.dev .. "  (" .. d.size .. ")",
-				dev = d.dev,
-			}
-		end
-	end
+	local items, sftp_mounted, smb_mounted = build_local_items()
 	set_items(items)
 
-	-- Phase 2: phones + network mounts (gio ~0.5s) — schedule after first render
-	local phase2_done = false
-	ya.timer(0, 1, function()
-		local phones, sftp_mounted, smb_mounted = query_gio()
-		for _, p in ipairs(phones) do
-			if p.mounted then
-				local entry = uri_to_gvfs_entry(p.uri)
-				if entry then link_mount(MTP_ROOT .. "/" .. entry, entry) end
-				items[#items + 1] = {
-					type = "unmount_phone",
-					label = "Unmount phone: " .. p.name,
-					uri = p.uri,
-				}
-			else
-				items[#items + 1] = {
-					type = "mount_phone",
-					label = "Mount phone: " .. p.name,
-					uri = p.uri,
-				}
-			end
-		end
-		for _, uri in ipairs(sftp_mounted) do
-			local entry = uri_to_gvfs_entry(uri)
-			if entry then link_mount(MTP_ROOT .. "/" .. entry, entry) end
-			items[#items + 1] = {
-				type = "unmount_sftp",
-				label = "Unmount SFTP: " .. uri:gsub("^sftp://", ""),
-				uri = uri,
-			}
-		end
-		for _, uri in ipairs(smb_mounted) do
-			local host, share = smb_host_share(uri)
-			local entry = nil
-			if host and share then
-				entry = find_gvfs_entry("^smb%-share:server=" .. host .. ",share=" .. share)
-			end
-			if not entry then entry = uri_to_gvfs_entry(uri) end
-			if entry then
-				if share then
-					link_mount(MTP_ROOT .. "/" .. entry, host .. "-" .. share)
-				else
-					link_mount(MTP_ROOT .. "/" .. entry, entry)
-				end
-			end
-			items[#items + 1] = {
-				type = "unmount_smb",
-				label = "Unmount SMB:  " .. uri:gsub("^smb://", ""),
-				uri = uri,
-			}
-		end
-		set_items(items)
-
-		-- Phase 3: avahi discovery
-		ya.timer(0, 1, function()
-			refresh_avahi(false)
-			local mounted_hosts = {}
-			for _, uri in ipairs(smb_mounted) do
-				local h = smb_host_share(uri)
-				if h then mounted_hosts[h] = true end
-			end
-			for _, uri in ipairs(sftp_mounted) do
-				local _, h = pcall(function()
-					local body = uri:match("^sftp://(.+)$") or ""
-					body = body:gsub("^([^/]-)@", "")
-					return (body:match("^([^/:]+)") or body):lower()
-				end)
-				if h then mounted_hosts[h] = true end
-			end
-			if HAS_GIO then
-				for _, host in ipairs(avahi_cache.ssh) do
-					if not mounted_hosts[host:lower()] then
-						items[#items + 1] = {
-							type = "mount_sftp_discovered",
-							label = "Mount SFTP  ›  " .. host,
-							host = host,
-						}
-					end
-				end
-				for _, host in ipairs(avahi_cache.smb) do
-					if not mounted_hosts[host:lower()] then
-						items[#items + 1] = {
-							type = "mount_smb_discovered",
-							label = "Mount SMB   ›  " .. host,
-							host = host,
-						}
-					end
-				end
-				items[#items + 1] = { type = "mount_sftp_manual", label = "Mount SFTP  ›  manual address…" }
-				items[#items + 1] = { type = "mount_smb_manual", label = "Mount SMB   ›  manual address…" }
-			end
-			if #items == 0 then
-				items[#items + 1] = { type = "noop", label = "(no devices or actions available)" }
-			end
-			set_items(items)
-			phase2_done = true
-		end)
-	end)
+	-- Phase 2+3: phones, network mounts, avahi discovery
+	append_discovered_items(items, sftp_mounted, smb_mounted)
+	if #items == 0 then
+		items[#items + 1] = { type = "noop", label = "(no devices or actions available)" }
+	end
+	set_items(items)
 
 	while true do
 		local idx = ya.which({ cands = self.keys, silent = true })
@@ -1164,110 +1065,29 @@ function M:entry()
 		elseif run == "bottom" then
 			set_cursor(math.huge)
 		elseif run == "refresh" then
-			refresh_avahi(false)
+			items, sftp_mounted, smb_mounted = build_local_items()
+			append_discovered_items(items, sftp_mounted, smb_mounted)
+			if #items == 0 then
+				items[#items + 1] = { type = "noop", label = "(no devices or actions available)" }
+			end
 			set_items(items)
 		elseif run == "rescan" then
-			set_items({ { type = "noop", label = "Re-scanning network..." } })
-			refresh_avahi(true)
-			-- Remove old discovered items, keep local
-			local new_items = {}
-			for _, it in ipairs(items) do
-				if not it.type:match("discovered") and it.type ~= "mount_sftp_manual" and it.type ~= "mount_smb_manual" then
-					new_items[#new_items + 1] = it
-				end
-			end
-			items = new_items
-			-- Re-append fresh discovered
-			local mounted_hosts = {}
-			for _, uri in ipairs(smb_mounted) do
-				local h = smb_host_share(uri)
-				if h then mounted_hosts[h] = true end
-			end
-			for _, uri in ipairs(sftp_mounted) do
-				local _, h = pcall(function()
-					local body = uri:match("^sftp://(.+)$") or ""
-					body = body:gsub("^([^/]-)@", "")
-					return (body:match("^([^/:]+)") or body):lower()
-				end)
-				if h then mounted_hosts[h] = true end
-			end
-			if HAS_GIO then
-				for _, host in ipairs(avahi_cache.ssh) do
-					if not mounted_hosts[host:lower()] then
-						items[#items + 1] = { type = "mount_sftp_discovered", label = "Mount SFTP  ›  " .. host, host = host }
-					end
-				end
-				for _, host in ipairs(avahi_cache.smb) do
-					if not mounted_hosts[host:lower()] then
-						items[#items + 1] = { type = "mount_smb_discovered", label = "Mount SMB   ›  " .. host, host = host }
-					end
-				end
-				items[#items + 1] = { type = "mount_sftp_manual", label = "Mount SFTP  ›  manual address…" }
-				items[#items + 1] = { type = "mount_smb_manual", label = "Mount SMB   ›  manual address…" }
+			set_items({ { type = "noop", label = "Re-scanning..." } })
+			items, sftp_mounted, smb_mounted = build_local_items()
+			append_discovered_items(items, sftp_mounted, smb_mounted, true)
+			if #items == 0 then
+				items[#items + 1] = { type = "noop", label = "(no devices or actions available)" }
 			end
 			set_items(items)
 		elseif run == "activate" then
 			local item = get_active_item()
 			activate(item)
 			-- Rebuild everything
-			items = {}
-			for _, d in ipairs(lsblk_parts()) do
-				if d.mountpoint == "" then
-					items[#items + 1] = { type = "mount_drive", label = "Mount drive  " .. d.dev .. "  (" .. d.size .. ")", dev = d.dev }
-				end
+			items, sftp_mounted, smb_mounted = build_local_items()
+			append_discovered_items(items, sftp_mounted, smb_mounted)
+			if #items == 0 then
+				items[#items + 1] = { type = "noop", label = "(no devices or actions available)" }
 			end
-			for _, d in ipairs(lsblk_parts()) do
-				if d.mountpoint:match("^/run/media") then
-					local name = d.dev:match("([^/]+)$") or d.dev
-					link_mount(d.mountpoint, name)
-					items[#items + 1] = { type = "unmount_drive", label = "Unmount drive  " .. d.dev .. "  (" .. d.size .. ")", dev = d.dev }
-				end
-			end
-			local phones, sftp_m, smb_m = query_gio()
-			sftp_mounted, smb_mounted = sftp_m, smb_m
-			for _, p in ipairs(phones) do
-				if p.mounted then
-					local entry = uri_to_gvfs_entry(p.uri)
-					if entry then link_mount(MTP_ROOT .. "/" .. entry, entry) end
-					items[#items + 1] = { type = "unmount_phone", label = "Unmount phone: " .. p.name, uri = p.uri }
-				else
-					items[#items + 1] = { type = "mount_phone", label = "Mount phone: " .. p.name, uri = p.uri }
-				end
-			end
-			for _, uri in ipairs(sftp_mounted) do
-				local entry = uri_to_gvfs_entry(uri)
-				if entry then link_mount(MTP_ROOT .. "/" .. entry, entry) end
-				items[#items + 1] = { type = "unmount_sftp", label = "Unmount SFTP: " .. uri:gsub("^sftp://", ""), uri = uri }
-			end
-			for _, uri in ipairs(smb_mounted) do
-				local host, share = smb_host_share(uri)
-				local entry = nil
-				if host and share then entry = find_gvfs_entry("^smb%-share:server=" .. host .. ",share=" .. share) end
-				if not entry then entry = uri_to_gvfs_entry(uri) end
-				if entry then
-					if share then link_mount(MTP_ROOT .. "/" .. entry, host .. "-" .. share)
-					else link_mount(MTP_ROOT .. "/" .. entry, entry) end
-				end
-				items[#items + 1] = { type = "unmount_smb", label = "Unmount SMB:  " .. uri:gsub("^smb://", ""), uri = uri }
-			end
-			refresh_avahi(false)
-			local mounted_hosts = {}
-			for _, uri in ipairs(smb_mounted) do local h = smb_host_share(uri); if h then mounted_hosts[h] = true end end
-			for _, uri in ipairs(sftp_mounted) do
-				local _, h = pcall(function() local body = uri:match("^sftp://(.+)$") or ""; body = body:gsub("^([^/]-)@", ""); return (body:match("^([^/:]+)") or body):lower() end)
-				if h then mounted_hosts[h] = true end
-			end
-			if HAS_GIO then
-				for _, host in ipairs(avahi_cache.ssh) do
-					if not mounted_hosts[host:lower()] then items[#items + 1] = { type = "mount_sftp_discovered", label = "Mount SFTP  ›  " .. host, host = host } end
-				end
-				for _, host in ipairs(avahi_cache.smb) do
-					if not mounted_hosts[host:lower()] then items[#items + 1] = { type = "mount_smb_discovered", label = "Mount SMB   ›  " .. host, host = host } end
-				end
-				items[#items + 1] = { type = "mount_sftp_manual", label = "Mount SFTP  ›  manual address…" }
-				items[#items + 1] = { type = "mount_smb_manual", label = "Mount SMB   ›  manual address…" }
-			end
-			if #items == 0 then items[#items + 1] = { type = "noop", label = "(no devices or actions available)" } end
 			set_items(items)
 		end
 	end
