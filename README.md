@@ -10,6 +10,7 @@ A collection of plugins for [Yazi](https://github.com/sxyazi/yazi).
 | [copy-content](copy-content.yazi/) | Copy the hovered file's contents to the system clipboard (text/empty only) |
 | [archive-manager](archive-manager.yazi/) | Archive toolkit: preview listings, extract, and compress (7z/zip/tar variants) |
 | [mounter](mounter.yazi/) | Interactive device mounter: USB drives, phones, SFTP/SMB via native yazi UI |
+| [physical-dir](physical-dir.yazi/) | Resolve symlinked directory to its physical (real) path |
 
 ## Installation
 
