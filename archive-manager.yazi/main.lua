@@ -1,7 +1,9 @@
 --- @since 26.5.6
---- @sync entry
 --- Archive toolkit for Yazi: extract, compress, and preview.
 --- Backed by `7z` (and `tar` for non-7z formats).
+---
+--- Must stay async: `ya.which` (format dropdown) only captures keys in async
+--- plugins. A sync entry lets <Enter> fall through to the manager `open`.
 
 local M = {}
 local TITLE = "Archive"
@@ -273,7 +275,11 @@ local function dropdown_select(title, options)
 	while true do
 		local idx = ya.which({ cands = DD_KEYS, silent = true })
 		ya.dbg("[archive-manager] ya.which returned", idx)
-		local cand = idx and DD_KEYS[idx]
+		-- nil => user cancelled / which aborted (do not spin forever)
+		if not idx then
+			break
+		end
+		local cand = DD_KEYS[idx]
 		local run = cand and cand.run
 		ya.dbg("[archive-manager] run =", run)
 
