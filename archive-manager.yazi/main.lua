@@ -1,4 +1,5 @@
 --- @since 26.5.6
+--- @sync entry
 --- Archive toolkit for Yazi: extract, compress, and preview.
 --- Backed by `7z` (and `tar` for non-7z formats).
 
@@ -21,6 +22,7 @@ local archive_exts = {
 	["tbz2"] = true,
 	["tzst"] = true,
 	["xapk"] = true,
+	["iso"] = true,
 }
 
 local function is_archive(name)
@@ -32,7 +34,8 @@ local function is_archive(name)
 end
 
 local function url_to_path(url)
-	local s = tostring(url)
+	local path = type(url) == "userdata" and url.path
+	local s = tostring(path or url)
 	if s:sub(1, 7) == "file://" then
 		return s:sub(8)
 	end
@@ -56,18 +59,88 @@ local function has_cmd(name)
 	return out and out.status and out.status.success
 end
 
+local function run_archive(command, action, target)
+	ya.async(function()
+	local task = ya.task("custom", {
+		pool = "plugin",
+		scope = rt.scope(),
+		track = true,
+		progress = true,
+	}):name(action .. " " .. target):spawn()
+
+	local child = command
+		:stdout(Command.PIPED)
+		:stderr(Command.PIPED)
+		:spawn()
+	if not child then
+		task:fail(action .. " could not be started")
+		notify(action .. " could not be started", "error")
+		return
+	end
+
+	local last_percent = -1
+	local reported_workload = false
+	while true do
+		local line, event = child:read_line()
+		if event == 2 then
+			break
+		elseif event ~= 0 and event ~= 1 then
+			task:fail(action .. " failed while reading progress")
+			notify(action .. " failed while reading progress", "error")
+			return
+		end
+
+		if line then
+			local text = tostring(line)
+			for value in text:gmatch("(%d?%d?%d)%%") do
+				local percent = tonumber(value)
+				if percent and percent > last_percent then
+					local processed = percent - math.max(last_percent, 0)
+					last_percent = percent
+					task:progress({
+						total = reported_workload and 0 or 1,
+						workload = reported_workload and 0 or 100,
+						processed = processed,
+					})
+					reported_workload = true
+				end
+			end
+		end
+	end
+
+	local result = child:wait_with_output()
+	if not result or not result.status or not result.status.success then
+		local error_text = result and result.stderr and tostring(result.stderr):gsub("%s+$", "")
+		task:fail(error_text or action .. " failed")
+		notify(
+			string.format("%s failed%s", action, error_text and error_text ~= "" and ": " .. error_text or ""),
+			"error"
+		)
+		return
+	end
+
+	task:progress({
+		total = reported_workload and 0 or 1,
+		success = 1,
+		workload = reported_workload and 0 or 100,
+		processed = reported_workload and math.max(0, 100 - math.max(last_percent, 0)) or 100,
+	})
+	task:succeed()
+	notify(action .. " complete", "info")
+	end)
+end
+
 -- ── Compress formats ───────────────────────────────────────────────────────
 
 local COMPRESS_FORMATS = {
-	["7z"]      = { ext = "7z", tool = "7z", build = function(out, files) return "7z a " .. out .. " " .. files end },
-	["zip"]     = { ext = "zip", tool = "7z", build = function(out, files) return "7z a -tzip " .. out .. " " .. files end },
-	["rar"]     = { ext = "rar", tool = "rar", build = function(out, files) return "rar a " .. out .. " " .. files end },
-	["tar"]     = { ext = "tar", tool = "tar", build = function(out, files) return "tar -cf " .. out .. " " .. files end },
-	["tar.gz"]  = { ext = "tar.gz", tool = "tar", build = function(out, files) return "tar -czf " .. out .. " " .. files end },
-	["tar.bz2"] = { ext = "tar.bz2", tool = "tar", build = function(out, files) return "tar -cjf " .. out .. " " .. files end },
-	["tar.xz"]  = { ext = "tar.xz", tool = "tar", build = function(out, files) return "tar -cJf " .. out .. " " .. files end },
-	["tar.zst"] = { ext = "tar.zst", tool = "tar", build = function(out, files) return "tar --zstd -cf " ..
-		out .. " " .. files end },
+	["7z"]      = { ext = "7z", tool = "7z", args = function(out, files) return { "a", "-bsp1", out, table.unpack(files) } end },
+	["zip"]     = { ext = "zip", tool = "7z", args = function(out, files) return { "a", "-tzip", "-bsp1", out, table.unpack(files) } end },
+	["rar"]     = { ext = "rar", tool = "rar", args = function(out, files) return { "a", out, table.unpack(files) } end },
+	["tar"]     = { ext = "tar", tool = "tar", args = function(out, files) return { "-cf", out, table.unpack(files) } end },
+	["tar.gz"]  = { ext = "tar.gz", tool = "tar", args = function(out, files) return { "-czf", out, table.unpack(files) } end },
+	["tar.bz2"] = { ext = "tar.bz2", tool = "tar", args = function(out, files) return { "-cjf", out, table.unpack(files) } end },
+	["tar.xz"]  = { ext = "tar.xz", tool = "tar", args = function(out, files) return { "-cJf", out, table.unpack(files) } end },
+	["tar.zst"] = { ext = "tar.zst", tool = "tar", args = function(out, files) return { "--zstd", "-cf", out, table.unpack(files) } end },
 }
 
 local DEFAULT_FORMAT = "7z"
@@ -267,8 +340,11 @@ local function perform_extract()
 
 	for _, path in ipairs(archives) do
 		local dir = path:match("^(.*)%.%w+$") or (path .. "_extracted")
-		local cmd = string.format("7z x %s -o%s -y", shell_quote(path), shell_quote(dir))
-		ya.emit("shell", { cmd, block = false })
+		run_archive(
+			Command("7z"):arg({ "x", "-bsp1", "-y", "-o" .. dir, path }),
+			"Extracting",
+			path:match("([^/]+)$") or path
+		)
 	end
 
 	notify(string.format("Extracting %d archive%s in background", #archives, #archives > 1 and "s" or ""))
@@ -310,14 +386,14 @@ local function perform_compress(format)
 		n = n + 1
 	end
 
-	local qfiles = {}
-	for _, f in ipairs(files) do
-		qfiles[#qfiles + 1] = shell_quote(f)
-	end
-	local cmd = fmt.build(shell_quote(out), table.concat(qfiles, " "))
+	local args = fmt.args(out, files)
 
 	ya.emit("escape", { visual = true })
-	ya.emit("shell", { cmd, block = false })
+	run_archive(
+		Command(fmt.tool):arg(args),
+		"Compressing",
+		out:match("([^/]+)$") or out
+	)
 
 	notify(string.format("Compressing %d item%s as %s", #files, #files == 1 and "" or "s", format))
 end

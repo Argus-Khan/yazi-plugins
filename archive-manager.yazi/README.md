@@ -8,6 +8,7 @@ An archive toolkit for Yazi: preview, extract, and compress. Backed by `7z` (and
 - **Extract** — `7z x` in the background with auto-naming of the output directory
 - **Compress** — `7z`/`zip`/`tar`/`tar.{gz,bz2,xz,zst}` of the current selection, auto-named, collision-safe (`_1`, `_2`, …)
 - All operations run in the background — yazi stays responsive
+- 7z and zip operations use Yazi's native live progress bar
 
 ## Installation
 
@@ -81,6 +82,12 @@ desc = "Compress selection as 7z"
 | `tar.bz2`        | `.tar.bz2`| `tar -cjf` |
 | `tar.xz`         | `.tar.xz` | `tar -cJf` |
 | `tar.zst`        | `.tar.zst`| `tar --zstd -cf` |
+
+7z and zip use 7-Zip's progress stream, so Yazi's native progress bar updates
+from the reported percentage instead of jumping directly from started to
+complete.
+Tar-based formats do not provide a portable total-progress stream and report
+completion after the command exits.
 
 Examples:
 

@@ -9,7 +9,8 @@ end)
 
 function M:entry()
 	local cwd = get_cwd()
-	local handle = io.popen("realpath " .. cwd)
+	local quoted = "'" .. tostring(cwd):gsub("'", "'\\''") .. "'"
+	local handle = io.popen("realpath " .. quoted)
 	if not handle then
 		ya.notify({ title = "Physical dir", content = "Failed to run realpath", timeout = 5, level = "error" })
 		return

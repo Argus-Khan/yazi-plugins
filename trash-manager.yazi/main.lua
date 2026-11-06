@@ -4,6 +4,9 @@
 --- restore / permanently delete / empty. Backed by `gio` (glib), which gives
 --- a unified cross-volume view and stable per-item handles (trash:/// URIs).
 ---
+--- Also provides "safe-remove": trash files from the file browser, using
+--- yazi's native remove for local drives and `gio remove` for MTP/network.
+---
 --- The "undo last trash" action is inspired by boydaihungst's `restore` plugin
 --- (MIT, https://github.com/boydaihungst/restore), reimplemented on top of
 --- `gio trash --restore` so it shares the same backend as the rest of the
@@ -46,6 +49,94 @@ local function filter_items(items, q)
 		end
 	end
 	return out
+end
+
+-- ── Safe Remove (trash files from the file browser) ─────────────────────────
+
+local MTP_PATTERNS = {
+	"/run/user/%d+/gvfs/mtp:host=",
+	"ExternalDrives/mtp:host=",
+}
+
+local function is_remote(path)
+	for _, pat in ipairs(MTP_PATTERNS) do
+		if path:match(pat) then
+			return true
+		end
+	end
+	if path:match("^/run/user/%d+/gvfs/") then
+		return true
+	end
+	return false
+end
+
+local function url_to_path(url)
+	local s = tostring(url)
+	if s:sub(1, 7) == "file://" then
+		return s:sub(8)
+	end
+	return s
+end
+
+--- Get selected/hovered files from the file browser (not the modal UI).
+local get_file_targets = ya.sync(function()
+	local tab = cx.active
+	local files = {}
+	if tab.selected then
+		for k, v in pairs(tab.selected) do
+			local url = type(v) == "boolean" and k or v
+			files[#files + 1] = { path = url_to_path(url), name = tostring(url):match("([^/]+)$") or "?" }
+		end
+	end
+	if #files == 0 and tab.current.hovered then
+		local url = tab.current.hovered.url
+		files[1] = { path = url_to_path(url), name = tostring(url):match("([^/]+)$") or "?" }
+	end
+	return files
+end)
+
+local function perform_safe_remove(permanent)
+	local files = get_file_targets()
+	if #files == 0 then
+		return
+	end
+
+	-- Split: remote (MTP/network) vs local.
+	local remote = {}
+	for _, f in ipairs(files) do
+		if is_remote(f.path) then
+			remote[#remote + 1] = f
+		end
+	end
+
+	-- Local files: yazi handles it natively.
+	if #remote < #files then
+		ya.emit("remove", permanent and { "--permanently" } or {})
+	end
+
+	-- Remote (MTP/network) files: gio remove — the only option.
+	if #remote > 0 then
+		local ok, fail = 0, 0
+		for _, f in ipairs(remote) do
+			local out = Command("gio")
+				:arg({ "remove", f.path })
+				:stdout(Command.PIPED)
+				:stderr(Command.PIPED)
+				:output()
+			if out and out.status and out.status.success then
+				ok = ok + 1
+			else
+				fail = fail + 1
+				local err = out and out.stderr and out.stderr:gsub("%s+", " ") or ""
+				notify("error", "Failed to delete %s: %s", f.name, err ~= "" and err or "unknown error")
+			end
+		end
+		if fail == 0 then
+			notify("info", "Deleted %d file%s", ok, ok == 1 and "" or "s")
+		elseif ok > 0 then
+			notify("warn", "Deleted %d, failed %d", ok, fail)
+		end
+	end
 end
 
 -- ── State (mutated only inside ya.sync, which can touch the UI) ──────────────
@@ -529,6 +620,11 @@ function M:entry(job)
 	-- Direct, UI-less entry: restore the most recently trashed batch.
 	if job.args and job.args[1] == "undo-last" then
 		perform_undo_last()
+		return
+	end
+	-- Direct, UI-less entry: trash/delete files from the file browser.
+	if job.args and job.args[1] == "safe-remove" then
+		perform_safe_remove(job.args[2] == "--permanent")
 		return
 	end
 	toggle_ui()

@@ -113,9 +113,17 @@ end
 
 local function save_credential(server, share, user, pass)
 	local label = user .. "@" .. server .. "/" .. share
+	local pw = shell_quote(pass)
+	-- own record, so load_credential finds it again
 	os.execute(string.format(
 		"secret-tool store --label %s service samba server %s share %s user %s 2>/dev/null <<< %s",
-		shell_quote(label), shell_quote(server), shell_quote(share), shell_quote(user), shell_quote(pass)
+		shell_quote(label), shell_quote(server), shell_quote(share), shell_quote(user), pw
+	))
+	-- gvfs looks up by its own schema and never sees the record above, so a mount
+	-- from this menu would prompt or fail. Store the same password where it looks.
+	os.execute(string.format(
+		"secret-tool store --label %s user %s server %s protocol smb xdg:schema org.gnome.keyring.NetworkPassword 2>/dev/null <<< %s",
+		shell_quote("smb://" .. server .. "/" .. share), shell_quote(user), shell_quote(server), pw
 	))
 end
 
@@ -394,11 +402,15 @@ local function query_gio()
 		phones[#phones + 1] = { name = name, uri = phone_uri, mounted = mounted }
 	end
 	-- Network mounts
-	for uri in std:gmatch(SFTP_URI_REGEX) do
-		sftp[#sftp + 1] = uri
-	end
-	for uri in std:gmatch(SMB_URI_REGEX) do
-		smb[#smb + 1] = uri
+	-- gio prints each mount twice: "Mount: x -> uri" and "default_location=uri".
+	-- Only the first is a real mount, so skip the default_location lines.
+	for line in std:gmatch("[^\n]+") do
+		if not line:find("default_location", 1, true) then
+			local u = line:match(SFTP_URI_REGEX)
+			if u then sftp[#sftp + 1] = u end
+			u = line:match(SMB_URI_REGEX)
+			if u then smb[#smb + 1] = u end
+		end
 	end
 	return phones, sftp, smb
 end
