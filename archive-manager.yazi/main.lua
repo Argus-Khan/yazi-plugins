@@ -4,6 +4,7 @@
 ---
 --- Must stay async: `ya.which` (format dropdown) only captures keys in async
 --- plugins. A sync entry lets <Enter> fall through to the manager `open`.
+--- Because entry is async, do not call `ya.async` here (sync-entry only).
 
 local M = {}
 local TITLE = "Archive"
@@ -61,8 +62,9 @@ local function has_cmd(name)
 	return out and out.status and out.status.success
 end
 
+-- Runs in the async entry context (do not wrap with ya.async — that API is
+-- sync-entry only). Command I/O yields, so the UI stays responsive via ya.task.
 local function run_archive(command, action, target)
-	ya.async(function()
 	local task = ya.task("custom", {
 		pool = "plugin",
 		scope = rt.scope(),
@@ -129,7 +131,6 @@ local function run_archive(command, action, target)
 	})
 	task:succeed()
 	notify(action .. " complete", "info")
-	end)
 end
 
 -- ── Compress formats ───────────────────────────────────────────────────────
@@ -343,6 +344,7 @@ local function perform_extract()
 	end
 
 	ya.emit("escape", { visual = true })
+	notify(string.format("Extracting %d archive%s", #archives, #archives > 1 and "s" or ""))
 
 	for _, path in ipairs(archives) do
 		local dir = path:match("^(.*)%.%w+$") or (path .. "_extracted")
@@ -352,8 +354,6 @@ local function perform_extract()
 			path:match("([^/]+)$") or path
 		)
 	end
-
-	notify(string.format("Extracting %d archive%s in background", #archives, #archives > 1 and "s" or ""))
 end
 
 -- ── Compress ───────────────────────────────────────────────────────────────
@@ -395,13 +395,12 @@ local function perform_compress(format)
 	local args = fmt.args(out, files)
 
 	ya.emit("escape", { visual = true })
+	notify(string.format("Compressing %d item%s as %s", #files, #files == 1 and "" or "s", format))
 	run_archive(
 		Command(fmt.tool):arg(args),
 		"Compressing",
 		out:match("([^/]+)$") or out
 	)
-
-	notify(string.format("Compressing %d item%s as %s", #files, #files == 1 and "" or "s", format))
 end
 
 -- ── Preview (peek/seek) ────────────────────────────────────────────────────
