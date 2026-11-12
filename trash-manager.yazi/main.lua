@@ -78,6 +78,16 @@ local function url_to_path(url)
 	return s
 end
 
+-- Resolve symlinks so classification sees the real target: yazi hands us
+-- ~/ExternalDrives/<link> paths, whose targets live under /run/user/*/gvfs/.
+local function resolve_path(path)
+	local out = Command("realpath"):arg({ "-m", path }):stdout(Command.PIPED):stderr(Command.PIPED):output()
+	if out and out.status and out.status.success and out.stdout and out.stdout ~= "" then
+		return (out.stdout:gsub("%s+$", ""))
+	end
+	return path
+end
+
 --- Get selected/hovered files from the file browser (not the modal UI).
 local get_file_targets = ya.sync(function()
 	local tab = cx.active
@@ -95,6 +105,11 @@ local get_file_targets = ya.sync(function()
 	return files
 end)
 
+-- Active tab's cwd as a plain path (safe-remove needs it before deleting).
+local get_active_cwd = ya.sync(function()
+	return url_to_path(tostring(cx.active.current.cwd))
+end)
+
 local function perform_safe_remove(permanent)
 	local files = get_file_targets()
 	if #files == 0 then
@@ -102,24 +117,71 @@ local function perform_safe_remove(permanent)
 	end
 
 	-- Split: remote (MTP/network) vs local.
+	-- Classify on the RESOLVED path: without this a gvfs target (via the
+	-- ExternalDrives symlink) counts as local, yazi's native trash runs, and
+	-- the trash crate looks for .Trash-1000 at the read-only gvfs root (ENOENT).
 	local remote = {}
 	for _, f in ipairs(files) do
-		if is_remote(f.path) then
+		if is_remote(resolve_path(f.path)) then
 			remote[#remote + 1] = f
 		end
 	end
 
+	-- Trash is impossible on gvfs mounts (GLib refuses "system internal"
+	-- mounts, `gio remove` can't recurse), so safe-remove on a remote path
+	-- falls back to a permanent rm. Ask before deleting anything.
+	if #remote > 0 and not permanent then
+		local sure = ya.confirm({
+			title = ui.Line("No trash on network/phone mounts"):style(ui.Style():fg("yellow"):bold()),
+			body = ui.Text({
+				ui.Line(""),
+				ui.Line(string.format(
+					"Permanently delete %d file%s? There is no undo on remote mounts.",
+					#remote, #remote == 1 and "" or "s"
+				)),
+			}),
+			pos = { "center", w = 64, h = 8 },
+		})
+		if not sure then
+			return
+		end
+	end
+
+	-- Never strand our own cwd: if the current dir sits inside a target,
+	-- move up to the outermost target's parent before deleting (our rm
+	-- bypasses yazi's own deleted-cwd recovery, so shell keymaps would
+	-- otherwise error with getcwd until yazi notices on its own).
+	local cwd = get_active_cwd()
+	local inside
+	for _, f in ipairs(remote) do
+		if (cwd == f.path or cwd:sub(1, #f.path + 1) == f.path .. "/") and (not inside or #f.path < #inside) then
+			inside = f.path
+		end
+	end
+	if inside then
+		local parent = inside:match("^(.*)/[^/]+$")
+		if parent == "" then
+			parent = "/"
+		end
+		if parent then
+			ya.emit("cd", { parent })
+		end
+	end
+
 	-- Local files: yazi handles it natively.
+	-- shortcut: yazi's `remove` acts on every selected file, so a mixed
+	-- local+remote selection still feeds the remote ones to native trash;
+	-- upgrade if yazi ever gains a per-file-scoped remove.
 	if #remote < #files then
 		ya.emit("remove", permanent and { "--permanently" } or {})
 	end
 
-	-- Remote (MTP/network) files: gio remove — the only option.
+	-- Remote (MTP/network) files: permanent rm (confirmed above for safe-remove).
 	if #remote > 0 then
 		local ok, fail = 0, 0
 		for _, f in ipairs(remote) do
-			local out = Command("gio")
-				:arg({ "remove", f.path })
+			local out = Command("rm")
+				:arg({ "-rf", "--", f.path })
 				:stdout(Command.PIPED)
 				:stderr(Command.PIPED)
 				:output()
@@ -132,7 +194,7 @@ local function perform_safe_remove(permanent)
 			end
 		end
 		if fail == 0 then
-			notify("info", "Deleted %d file%s", ok, ok == 1 and "" or "s")
+			notify("info", "Permanently deleted %d file%s", ok, ok == 1 and "" or "s")
 		elseif ok > 0 then
 			notify("warn", "Deleted %d, failed %d", ok, fail)
 		end
